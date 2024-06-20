@@ -1,5 +1,7 @@
 import os
 import http.client, urllib
+from IPython import get_ipython
+from IPython.core.ultratb import AutoFormattedTB
 
 # Send a push message via Pushover
 def send_push(message):
@@ -44,3 +46,21 @@ def speak(text):
 def ding(text="Task complete"):
     #speak(text)
     send_push(text)
+
+
+def jupyter_preprocess():
+    """Function to run at the start of Jupyter Notebook."""
+    # ref. https://stackoverflow.com/a/40135960
+    itb = AutoFormattedTB(mode="Plain", tb_offset=1)
+
+    def custom_exc(shell, etype, evalue, tb, tb_offset=None):
+        shell.showtraceback((etype, evalue, tb), tb_offset=tb_offset)
+        stb = itb.structured_traceback(etype, evalue, tb)
+        sstb = itb.stb2text(stb)
+
+        # Write the code to be executed during an exception here
+        ding("ERROR: An exception has occurred.")
+
+        return sstb
+
+    get_ipython().set_custom_exc((Exception,), custom_exc)

@@ -3,6 +3,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from shared import reload_model, compute_metrics
+from matplotlib import cm
+from matplotlib.colors import Normalize
+from scipy.interpolate import interpn
 
 model_list = [
     "baseline",
@@ -21,31 +24,66 @@ def models_and_true(models):
     else:
         return models
 
+
+# Found here: https://stackoverflow.com/questions/20105364/how-can-i-make-a-scatter-plot-colored-by-density/53865762#53865762
+def density_scatter(x, y, ax=None, fig=None, sort=True, bins=20, **kwargs):
+    """
+    Scatter plot colored by 2d histogram
+    """
+    if ax is None:
+        fig, ax = plt.subplots()
+    data, x_e, y_e = np.histogram2d(x, y, bins=bins, density=True)
+    z = interpn(
+        (0.5 * (x_e[1:] + x_e[:-1]), 0.5 * (y_e[1:] + y_e[:-1])),
+        data,
+        np.vstack([x, y]).T,
+        method="splinef2d",
+        bounds_error=False,
+    )
+
+    # To be sure to plot all data
+    z[np.where(np.isnan(z))] = 0.0
+
+    # Sort the points by density, so that the densest points are plotted last
+    if sort:
+        idx = z.argsort()
+        x, y, z = x[idx], y[idx], z[idx]
+    ax.scatter(x, y, c=z, **kwargs)
+
+    norm = Normalize(vmin=np.min(z), vmax=np.max(z))
+    cbar = fig.colorbar(cm.ScalarMappable(norm=norm), ax=ax)
+    cbar.ax.set_ylabel("Density")
+
+    return ax    
+
 # Plot the prediction histogram and scatter plot (vs true value)
 def pred_plot(predictions, model, sample_frac=1):
     p = predictions.sample(frac=sample_frac)
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
     sns.histplot(data=p[["True GPP", model]], bins=20, kde=True, ax=axes[0])
     line_x = [predictions["True GPP"].min(), predictions["True GPP"].max()]
     axes[1].plot(line_x, line_x, c="gray")
-    sns.scatterplot(x=p["True GPP"], y=p[model], ax=axes[1], alpha=0.7)
+    density_scatter(p["True GPP"], p[model], bins=[10, 10], ax=axes[1], fig=fig)
+    #sns.scatterplot(x=p["True GPP"], y=p[model], ax=axes[1], alpha=0.7)
     axes[0].set_xlabel("GPP")
     axes[0].set_title("True and predicted densities")
     axes[1].set_xlabel("True GPP")
     axes[1].set_ylabel("Predicted GPP")
-    axes[1].set_title("Comparision of predictions against ground truth")
+    axes[1].set_title("Comparison of predictions against ground truth")
     plt.suptitle(f"{model} analysis")
     plt.tight_layout()
     plt.show()
     
 
 # Plot the prediction error histogram and scatter plot (vs true value)
-def err_plot(predictions, errors, model):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+def err_plot(predictions, model):
+    errors = predictions.sub(predictions["True GPP"], axis=0)
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
     sns.histplot(data=errors[model], bins=20, kde=True, ax=axes[0])
     line_x = np.array([predictions["True GPP"].min(), predictions["True GPP"].max()])
     axes[1].plot(line_x, 0 * line_x, c="gray")
-    sns.scatterplot(x=predictions["True GPP"], y=errors[model], ax=axes[1], alpha=0.7)
+    density_scatter(predictions["True GPP"], errors[model], bins=[10, 10], ax=axes[1], fig=fig)
+    #sns.scatterplot(x=predictions["True GPP"], y=errors[model], ax=axes[1], alpha=0.7)
     axes[0].set_xlabel("Prediction error")
     axes[0].set_title("Error densities")
     axes[1].set_xlabel("True GPP")
@@ -57,7 +95,8 @@ def err_plot(predictions, errors, model):
 
     
 # Plot the monthly and per site prediction error densities
-def error_per_month_and_site(errors, model):
+def error_per_month_and_site(predictions, model):
+    errors = predictions.sub(predictions["True GPP"], axis=0)
     fig, axes = plt.subplots(2, 1, figsize=(12, 6))
     sns.barplot(
         x=errors.index.get_level_values(1).month, y=model, data=errors, ax=axes[0]
@@ -80,7 +119,8 @@ def error_per_month_and_site(errors, model):
     plt.show()
 
 # Plot the monthly and yearly prediction error densities
-def error_per_month_and_year(errors, model):
+def error_per_month_and_year(predictions, model):
+    errors = predictions.sub(predictions["True GPP"], axis=0)
     fig, axes = plt.subplots(2, 1, figsize=(12, 6))
     sns.violinplot(x=errors.index.month, y=model, data=errors, ax=axes[0])
     sns.violinplot(
@@ -107,30 +147,32 @@ def plot_densities(predictions, models=model_list[1:], cover_type=None):
     plt.xlabel("GPP")
     plt.legend()
     if cover_type:
-        plt.title(f"Comparision of the model densities for {cover_type}")
+        plt.title(f"Comparison of the model densities for {cover_type}")
     else:
-        plt.title("Comparision of the model densities")
+        plt.title("Comparison of the model densities")
     plt.show()
 
 # Plot violin plot of the error for all provided models
-def plot_errors(errors, models=model_list):
+def plot_errors(predictions, models=model_list):
+    errors = predictions.sub(predictions["True GPP"], axis=0)
     plt.figure(figsize=(7, 5))
     sns.violinplot(data=errors[models])
-    plt.title("Comparision of model errors")
+    plt.title("Comparison of model errors")
     plt.ylabel("Prediction error")
     plt.tight_layout()
     plt.show()
     
 # Plot predicted densities and violin plot for all provided models
-def plot_desity_and_errors(predictions, errors, models=model_list[1:], cover_type=None):
+def plot_desity_and_errors(predictions, models=model_list[1:], cover_type=None):
+    errors = predictions.sub(predictions["True GPP"], axis=0)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     for m in models_and_true(models):
         sns.kdeplot(predictions[m], label=m, ax=axes[0])
     axes[0].set_xlabel("GPP")
     axes[0].legend()
-    axes[0].set_title(f"Comparision of the model densities")
+    axes[0].set_title(f"Comparison of the model densities")
     sns.violinplot(data=errors[["baseline"] + models], ax=axes[1])
-    axes[1].set_title("Comparision of model errors")
+    axes[1].set_title("Comparison of model errors")
     axes[1].set_ylabel("Prediction error")
     for tick in axes[1].get_xticklabels():
         tick.set_rotation(25)
@@ -157,18 +199,26 @@ def plot_metrics(results, labels, sort_by=None):
     plt.show()
 
 # Plot the predicted and true value, and error timelines
-def plot_timeline(predictions, errors, model, site_type):
-    fig, axes = plt.subplots(2, 1, figsize=(12, 6))
+def plot_timeline(predictions, model, site_type):
+    errors = predictions.sub(predictions["True GPP"], axis=0)
+    fig, axes = plt.subplots(3, 1, figsize=(12, 9))
     axes[0].plot(
         predictions[["True GPP", model]], ".", label=["True GPP", "Prediction"]
     )
-    axes[1].plot(errors[model], ".")
+    predictions[["True GPP", model]].rolling("30d", center=True).mean().plot(
+        ax=axes[1], label=["True GPP", "Prediction"]
+    )
+    axes[2].plot(errors[model], ".")
     axes[0].legend()
     axes[0].set_ylabel("GPP")
-    axes[1].set_title("Timeline errors")
-    axes[1].set_ylabel("Error")
-    axes[1].set_title("Timeline predictions")
-    plt.suptitle(f"Timeline for {site_type} (model: {model})")
+    axes[0].set_title("Timeline predictions")
+    axes[1].legend()
+    axes[1].set_ylabel("GPP")
+    axes[1].set_title("Timeline predictions (30 days rolling window)")
+    axes[2].set_title("Timeline errors")
+    axes[2].set_ylabel("Error")
+    axes[2].set_title("Timeline predictions")
+    plt.suptitle(f"Timelines for {site_type} (model: {model})")
     plt.tight_layout()
     plt.show()
 
@@ -226,9 +276,6 @@ def characteristic(model, y_true):
     y_test_tr = model.best_estimator_.transformer_.transform(
         pd.DataFrame(y_true)
     ).squeeze()
-    # vm = min(df_pred["True GPP"].min(), y_test_tr.min())
-    # vx = max(df_pred["True GPP"].max(), y_test_tr.max())
-    # plt.plot([vm, vx], [vm, vx], c="gray")
     sns.scatterplot(
         x=y_true,
         y=y_test_tr,

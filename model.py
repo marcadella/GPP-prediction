@@ -10,7 +10,7 @@ from sklearn.metrics import (
 )
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import Ridge, Lasso
-from sklearn.preprocessing import StandardScaler, RobustScaler, QuantileTransformer
+from sklearn.preprocessing import StandardScaler, RobustScaler, QuantileTransformer, PolynomialFeatures
 from sklearn.compose import TransformedTargetRegressor, ColumnTransformer
 from sklearn.model_selection import GridSearchCV, ParameterGrid, ShuffleSplit
 from sklearn.decomposition import PCA
@@ -31,6 +31,9 @@ from shared import (
     compute_metrics
 )
 from extra import ding
+from grid_search_patch import grid_search
+import json
+import matplotlib.colors as colors
 
 resources = "resources/"
 memory = ".memory"
@@ -65,12 +68,12 @@ def train_and_test(model_name, model, X_tv, y_tv, X_test, y_test, fit_params={})
         pass
     # Compute the metrics
     compute_metrics(model, X_tv, y_tv, "train")
-    compute_metrics(model, X_test, y_test, "test")
+    y_pred, pred_time, r2, mae, rmse = compute_metrics(model, X_test, y_test, "test")
     if model_name:
         # Persist model to disk
         with open(os.path.join(resources, f"{model_name}.pkl"), "wb") as f:
             dump(model, f, protocol=5)
-    return train_time
+    return train_time, y_pred, pred_time, r2, mae, rmse
 
 
 # Format a string using a text wrapper
@@ -79,11 +82,12 @@ def formatter(lbl, pos=0):
 
 
 # Display a hyperparameter graph
-def display_graph(
+def hyperparam_graph(
     model,
     hyperparam_name,  # Hyperparameter name
     xlog=False,  # Whether X axis should be logarithmic
     xint=False,  # Whether the X axis should be integers
+    param_prefix="regressor__"
 ):
     plt.figure(figsize=(8, 4))
     cv_results = pd.DataFrame(model.cv_results_)
@@ -91,12 +95,12 @@ def display_graph(
     # We group the results by `hyperparam_name`
     # The reason for the try/except is to handle cases where the hyperparameter is not numeric (ex: a scaler)
     try:
-        cv_results["group"] = cv_results["param_regressor__" + hyperparam_name]
+        cv_results["group"] = cv_results["param_" + param_prefix + hyperparam_name]
         grouped = cv_results.groupby("group")
         params = grouped.indices.keys()
     except:
         is_obj = True
-        cv_results["group"] = cv_results["param_regressor__" + hyperparam_name].astype(
+        cv_results["group"] = cv_results["param_" + param_prefix + hyperparam_name].astype(
             str
         )
         grouped = cv_results.groupby("group")
@@ -156,6 +160,82 @@ def display_graph(
     plt.legend()
     plt.tight_layout()
     plt.show()
+
+def truncate_colormap(cmap, minval=0.0, maxval=1.0, n=100):
+    new_cmap = colors.LinearSegmentedColormap.from_list(
+        "trunc({n},{a:.2f},{b:.2f})".format(n=cmap.name, a=minval, b=maxval),
+        cmap(np.linspace(minval, maxval, n)),
+    )
+    return new_cmap
+
+
+default_cmap = truncate_colormap(plt.get_cmap("Blues_r"), 0.3, 1)    
+
+def hyperparam_plot(
+    model, parameters, subset={}, kind="bar", cmap=default_cmap, prefix="regressor__", figsize=(8, 8)
+):
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    parameters = [f"{prefix}{p}" for p in parameters]
+    if len(parameters) == 1:
+        parameters = parameters[0]
+    subset = {f"{prefix}{k}": v for k, v in subset.items()}
+    # See doc here: https://sklearn-evaluation.ploomber.io/en/latest/classification/optimization.html#visualise-results
+    ax = grid_search(
+        model.cv_results_,
+        change=parameters,
+        subset=subset,
+        kind=kind,
+        cmap=cmap,
+        ax=ax
+    )
+
+    def print_dict(d):
+        arr = [f"{k}: {v}" for k, v in d.items()]
+        return "\n".join(arr)
+
+    def parse_labels(labels):
+        items = []
+        for label in labels:
+            label = label.replace(" ", "")
+            label = label.replace(",", '","')
+            label = label.replace(":", '":"')
+            label = '{"' + label + '"}'
+            dic = json.loads(label)
+            items.append({k.removeprefix(prefix): v for k, v in dic.items()})
+        return items
+
+    def simplify_items(items):
+        to_remove_keys = []
+        for k in items[0].keys():
+            values = []
+            for i in items:
+                values.append(i[k])
+            # Remove duplicates
+            values = list(dict.fromkeys(values))
+            if len(values) < 2:
+                to_remove_keys.append(k)
+        for i in items:
+            for key in to_remove_keys:
+                i.pop(key, None)
+        return items
+
+    def format_labels(labels):
+        items = parse_labels(labels)
+        items = simplify_items(items)
+        labels = [print_dict(i) for i in items]
+        return labels
+
+    h, labels = ax.get_legend_handles_labels()
+    if len(labels) > 0:
+        ax.legend(format_labels(labels))
+    if len(subset) == 0:
+        title = ""
+    else:
+        title = print_dict(subset)
+    ax.set_title(title)
+    plt.suptitle("Grid search mean scores")
+    plt.tight_layout()
+    plt.show()
     
     
 # Helper function to create grid dicts
@@ -183,7 +263,8 @@ def eval_model(
     X_tv, y_tv, X_test, y_test,
     features=None,  # Subset of features to use. If None, all features are used
     pca=False,  # If True, a PCA is inserted before the regressor
-    n_splits=3,  # Number of splits. A ShuffleSplit is used with test_size of 0.3
+    poly=False,
+    n_splits=3,  # Number of splits. A ShuffleSplit is used with test_size of 0.3. Set to 0 to disable CV altogether
     train_size=None,  # Size of the test splits (number of samples per split). If None, complement of the test_size
     scoring="neg_mean_absolute_error",
     n_jobs=4,
@@ -209,22 +290,32 @@ def eval_model(
     else:
         pca_tr = None
         mem = None
+    
+    if poly:
+        poly_tr = PolynomialFeatures()
+    else:
+        poly_tr = None
 
     # Pipeline including the regressor provided in as a parameter
     reg = Pipeline(
-        [("selector", ct), ("scaler", None), ("pca", pca_tr), ("reg", regressor)],
+        [("selector", ct), ("scaler", None), ("poly", poly_tr), ("pca", pca_tr), ("reg", regressor)],
         memory=mem,
     )
 
     # Wrap the pipeline in a TransformedTargetRegressor to scale the target variable
     tr_regressor = TransformedTargetRegressor(regressor=reg, transformer=None)
     #print(tr_regressor)
+    
+    if n_splits > 0:
+        cv = ShuffleSplit(n_splits, test_size=0.3, train_size=train_size)
+    else:
+        cv = [(slice(None), slice(None))]
 
     # Wrap into a GridSearchCV
     model = GridSearchCV(
         tr_regressor,
         grid,
-        cv=ShuffleSplit(n_splits, test_size=0.3, train_size=train_size),
+        cv=cv,
         return_train_score=True,
         scoring=scoring,
         #refit=scoring[0],
@@ -233,11 +324,11 @@ def eval_model(
     )
 
     # Train and test the model
-    fitting_time = train_and_test(name, model, X_tv, y_tv, X_test, y_test)
+    fitting_time, y_pred, pred_time, r2, mae, rmse = train_and_test(name, model, X_tv, y_tv, X_test, y_test)
     time_obj = time.gmtime(fitting_time)
     
     # Notify
     if name:
         ding(f"Model {name} completed in {time.strftime('%H:%M:%S', time_obj)}")
 
-    return model
+    return model, y_pred, pred_time, r2, mae, rmse

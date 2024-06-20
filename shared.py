@@ -123,8 +123,132 @@ def daylength(dayOfYear, lat):
 
 # Load data from path and performs the processing defined in the EDA (feature engineering, bad removal).
 # It does not perform scaling or outlier remval so there is no data leakage here.
+# If qc_threshold is defined (between 0 and 1), cleaning badsed on QC values is performed.
 # For details about the actions performed, please see in the EDA.
-def processing_data(path, metadata_path):
+def process_multi_site(path, metadata_path, qc_threshold=None, show_na=False, keep_qc=False, rolling_variables=["P_F", "TA_F_MDS", "VPD_F_MDS"]):
+    print("Loading the data")
+    df = pd.read_csv(path)
+    df["TIMESTAMP"] = pd.to_datetime(df["TIMESTAMP"])
+    df["month"] = df["TIMESTAMP"].dt.month
+    df["year"] = df["TIMESTAMP"].dt.year
+    df["day_of_year"] = df["TIMESTAMP"].dt.dayofyear
+
+    print("Loading metadata and joining")
+    site_df = pd.read_csv(metadata_path, index_col="sitename")
+    df_join = df.join(site_df[["lat"]], on="sitename")
+    df["lat"] = df_join["lat"]
+
+    df.set_index(["sitename", "TIMESTAMP"], drop=True, inplace=True)
+    df.index.names = ["site", "date"]
+
+    print("Adding GPP and GPP_diff")
+    df["GPP"] = df[["GPP_NT_VUT_REF", "GPP_DT_VUT_REF"]].mean(axis=1, skipna=False)
+    df["GPP_diff"] = df["GPP_NT_VUT_REF"] - df["GPP_DT_VUT_REF"]
+
+    def features(data):
+        return [f for f in data.columns.values if not f.endswith("_QC") or keep_qc]
+
+    if qc_threshold:
+        f_qc_check = ["TA_F_MDS_QC", "SW_IN_F_MDS_QC", "VPD_F_MDS_QC", "NEE_VUT_REF_QC"]
+        bad_data_mask = (df[f_qc_check] < qc_threshold).any(axis=1)
+
+        def blur(x):
+            d = x.loc[x.index[0][0]]
+            return d.rolling(window="29d", center=True, min_periods=14).apply(
+                lambda w: w.sum() > len(w) / 2
+            )
+
+        smooth_bad_data_mask = (
+            bad_data_mask.groupby("site").apply(lambda x: blur(x)) == 1
+        )
+        trash_count = smooth_bad_data_mask.sum()
+        print(
+            f"Samples to discard: {trash_count} ({(smooth_bad_data_mask.sum() / len(df)).round(2) * 100}%)"
+        )
+        df = df[features(df)].copy()[~smooth_bad_data_mask]
+
+    print("Dropping unused features")
+    discarded_features = [
+        "NETRAD",
+        "SW_OUT",
+        "USTAR",
+        "NEE_VUT_REF",
+        "RECO_NT_VUT_REF",
+        "H_CORR",
+        "LE_CORR",
+        "H_CORR_JOINTUNC",
+        "LE_CORR_JOINTUNC",
+        "TMIN_F_MDS",
+        "TMAX_F_MDS",
+    ]
+    df.drop(discarded_features, inplace=True, axis=1)
+
+    print("Removing bad values")
+
+    def nullate_lower_than(d, field, limit=-9998):
+        d.loc[d[field] <= limit, field] = np.nan
+
+    for f in df.select_dtypes(include="number").columns:
+        nullate_lower_than(df, f)
+
+    print("Adding rolling window features")
+
+    def func(x, window):
+        d = x.loc[x.index[0][0]]
+        return d.rolling(window=f"{window}d", min_periods=int(window / 2)).apply(
+            lambda w: w.mean()
+        )
+
+    for f in rolling_variables:
+        for period in [1, 4]:
+            print(f"Processing {f}_{period}w...")
+            df[f"{f}_{period}w"] = df.groupby("site").apply(
+                lambda x: func(x[f], period * 7)
+            )
+
+    print("Adding engineered features")
+    df["day_length"] = df.apply(lambda x: daylength(x["day_of_year"], x["lat"]), axis=1)
+    df["solar_altitude"] = df.apply(
+        lambda x: solar_altitude(x["day_of_year"], x["lat"]), axis=1
+    )
+    df["apar"] = df["SW_IN_F_MDS"] * df["FPAR"]
+    df["TA_F_MDS**2"] = (df["TA_F_MDS"] + 41) ** 2
+    df["TA_F_MDS_1w**2"] = (df["TA_F_MDS_1w"] + 41) ** 2
+    df["TA_F_MDS_4w**2"] = (df["TA_F_MDS_4w"] + 41) ** 2
+
+    print("Remove unused features")
+    excluded_features = [
+        "CO2_F_MDS",  # As explained above
+        "GPP_DT_VUT_REF",  # Already included in GPP
+        "GPP_NT_VUT_REF",  # Already included in GPP
+        "TIMESTAMP",
+        "sitename",
+        "lat",
+        "day_of_year",
+        "month",
+        "year",
+    ]
+    if not keep_qc:
+        excluded_features = excluded_features + ["GPP_diff"]
+    working_features = [f for f in features(df) if f not in excluded_features]
+    df = df[working_features].copy()
+    df.shape
+
+    df.drop(["VPD_DAY_F_MDS", "TA_DAY_F_MDS", "P_F"], axis=1, inplace=True)
+    df.shape
+
+    print(f"NA: {(df.isna().any(axis=1)).sum()}")
+    if show_na:
+        msno.matrix(df, labels=True)
+        plt.show()
+
+    return df
+
+
+# Load data from path and performs the processing defined in the EDA (feature engineering, bad removal).
+# It does not perform scaling or outlier remval so there is no data leakage here.
+# For details about the actions performed, please see in the EDA.
+def process_single_site(path, metadata_path, with_rolling_windows=True):
     print("Loading the data")
     df = pd.read_csv(path)
     df["TIMESTAMP"] = pd.to_datetime(df["TIMESTAMP"])
@@ -177,23 +301,24 @@ def processing_data(path, metadata_path):
         nullate_lower_than(df, f)
 
 
-    print("Adding rolling window features")
-    def func(x, window):
-        d = x.loc[x.index[0][0]]
-        return d.rolling(window=f"{window}d", min_periods=int(window / 2)).apply(
-            lambda w: w.mean()
-        )
-
-
-    for f in ["P_F", "TA_F_MDS", "VPD_F_MDS"]:
-        for period in [1, 4]:
-            print(f"Processing {f}_{period}w...")
-            window = period * 7
-            df[f"{f}_{period}w"] = (
-                df[f]
-                .rolling(window=f"{window}d", min_periods=int(window / 2))
-                .apply(lambda w: w.mean())
+    if with_rolling_windows:
+        print("Adding rolling window features")
+        def func(x, window):
+            d = x.loc[x.index[0][0]]
+            return d.rolling(window=f"{window}d", min_periods=int(window / 2)).apply(
+                lambda w: w.mean()
             )
+
+
+        for f in ["P_F", "TA_F_MDS", "VPD_F_MDS"]:
+            for period in [1, 4]:
+                print(f"Processing {f}_{period}w...")
+                window = period * 7
+                df[f"{f}_{period}w"] = (
+                    df[f]
+                    .rolling(window=f"{window}d", min_periods=int(window / 2))
+                    .apply(lambda w: w.mean())
+                )
 
     print("Adding engineered features")
     df["day_length"] = df.apply(lambda x: daylength(x["day_of_year"], x["lat"]), axis=1)
@@ -202,8 +327,9 @@ def processing_data(path, metadata_path):
     )
     df["apar"] = df["SW_IN_F_MDS"] * df["FPAR"]
     df["TA_F_MDS**2"] = (df["TA_F_MDS"] + 41) ** 2
-    df["TA_F_MDS_1w**2"] = (df["TA_F_MDS_1w"] + 41) ** 2
-    df["TA_F_MDS_4w**2"] = (df["TA_F_MDS_4w"] + 41) ** 2
+    if with_rolling_windows:
+        df["TA_F_MDS_1w**2"] = (df["TA_F_MDS_1w"] + 41) ** 2
+        df["TA_F_MDS_4w**2"] = (df["TA_F_MDS_4w"] + 41) ** 2
 
     print("Remove unused features")
     excluded_features = [
@@ -221,8 +347,10 @@ def processing_data(path, metadata_path):
     working_features = [f for f in features(df) if f not in excluded_features]
     df = df[working_features].copy()
     df.shape
-
-    df.drop(["VPD_DAY_F_MDS", "TA_DAY_F_MDS", "P_F"], axis=1, inplace=True)
+    df.drop(["VPD_DAY_F_MDS", "TA_DAY_F_MDS"], axis=1, inplace=True)
+    if with_rolling_windows:
+        # With rolling windows, we exclude P_F as the precipitation happening today is unlikely to affect today's GPP
+        df.drop(["P_F"], axis=1, inplace=True)
     df.shape
 
     print(f"NA: {(df.isna().any(axis=1)).sum()}")
