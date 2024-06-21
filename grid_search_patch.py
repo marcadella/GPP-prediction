@@ -9,12 +9,12 @@ import collections
 import matplotlib.pyplot as plt
 import numpy as np
 from six import string_types
-from sklearn_evaluation.telemetry import SKLearnEvaluationLogger
+#from sklearn_evaluation.telemetry import SKLearnEvaluationLogger
 
 from sklearn_evaluation.plot.matplotlib.bar import BarShifter
 
 from ploomber_core.exceptions import modify_exceptions
-from sklearn_evaluation.plot.style import apply_theme
+#from sklearn_evaluation.plot.style import apply_theme
 from ploomber_core import validate
 
 from sklearn_evaluation.util import (
@@ -53,8 +53,8 @@ def _validate_kind_input(kind, valid):
     validate.keys(valid, passed=kind, name="kind")
 
 
-@SKLearnEvaluationLogger.log(feature="plot")
-@modify_exceptions
+#@SKLearnEvaluationLogger.log(feature="plot")
+#@modify_exceptions
 def grid_search(
     cv_results_, change, subset=None, kind="line", cmap=None, ax=None, sort=True
 ):
@@ -296,10 +296,17 @@ def _grid_search_double(grid_scores, change, subset, cmap, ax, sort):
 
     im = ax.imshow(matrix, interpolation="nearest", aspect='auto', cmap=cmap)
 
+    # Get max validation score
+    best_score = max([ v.mean_validation_score for _, v in m.items() ])
+    
     # set text on cells
     for (x, y), v in m.items():
         label = "{:.3}".format(v.mean_validation_score)
-        ax.text(x, y, label, horizontalalignment="center", verticalalignment="center")
+        if v.mean_validation_score == best_score:
+            c = "r"
+        else:
+            c = "k"
+        ax.text(x, y, label, horizontalalignment="center", verticalalignment="center", c=c)
     
     ax.set_xticks(range(cols))
     ax.set_xticklabels(col_labels, rotation=90)

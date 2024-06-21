@@ -1,100 +1,8 @@
-import h5py
-import io
-from tensorflow import keras
-from tensorflow.keras.wrappers.scikit_learn import KerasRegressor
-from tensorflow.keras import regularizers, layers, models, optimizers, callbacks
-from sklearn.base import BaseEstimator
-from pickle import load
 import os
 import numpy as np
 import pandas as pd
 import missingno as msno
 import matplotlib.pyplot as plt
-import time
-from sklearn.metrics import (
-    mean_absolute_error as MAE,
-    mean_squared_error as RMSE,
-    r2_score as R2,
-)
-
-# KerasRegressor is not pickleable. This wrapper is meant to solve this issue, but it does work with callbacks...
-# Solution from https://github.com/keras-team/keras/issues/13168#issuecomment-672792106
-class PickleableKerasRegressor(KerasRegressor, BaseEstimator):       
-    def _pickle_model(self):
-        bio = io.BytesIO()
-        with h5py.File(bio, "w") as f:
-            self.model.save(f)
-        return bio
-
-    def _unpickle_model(self, model):
-        with h5py.File(model, "r") as f:
-            model = models.load_model(f)
-        return model
-
-    def __getstate__(self):
-        state = BaseEstimator.__getstate__(self)
-        if hasattr(self, "model"):
-            state["model"] = self._pickle_model()
-        return state
-
-    def __setstate__(self, state):
-        if state.get("model", None):
-            state["model"] = self._unpickle_model(state["model"])
-        return BaseEstimator.__setstate__(self, state)
-
-
-# It is unfortunately not possible to get the history when using KerasRegressor within a Pipeline.
-# This wrapper is solving this issue by saving the history locally.
-# It is however not pickleable somehow, so we could not merge it with PickleableKerasRegressor.
-class HistoryKerasRegressor(KerasRegressor, BaseEstimator):
-    def __init__(self, *args, **kwargs):
-        super(KerasRegressor, self).__init__(*args, **kwargs)
-        self.history = None
-        
-    def get_history(self):
-        return self.history
-    
-    def fit(self, X, y, *args, **kwargs):
-        self.history = KerasRegressor.fit(self, X, y, *args, **kwargs)
-        return self.history
-        
-
-# Function generating our Keras model
-def model_fun(
-    hidden=3,
-    neurons=30,
-    dropout=0,
-    learning_rate=0.003,
-    input_shape=[22],
-    activation="relu",
-    l2=0.01,
-    loss="mse",
-    show_summary=False
-):
-    model = models.Sequential()
-    model.add(layers.InputLayer(input_shape=input_shape))
-    for layer in range(hidden):
-        model.add(
-            layers.Dense(
-                neurons, activation=activation, kernel_regularizer=regularizers.L2(l2)
-            )
-        )
-        if dropout != 0:
-            model.add(layers.Dropout(dropout))
-    model.add(layers.Dense(1))
-    optimizer = optimizers.SGD(learning_rate=learning_rate)
-    model.compile(loss=loss, optimizer=optimizer)
-    if show_summary:
-        model.summary()
-    return model
-
-
-# Load a model by unpickleing it
-# Do NOT call load_model because of name conflict!
-def reload_model(name):
-    with open(os.path.join("resources", f"{name}.pkl"), "rb") as f:
-        model = load(f)
-    return model
 
 # Computes the declination from the day of the year
 # Source: https://gist.github.com/anttilipp/ed3ab35258c7636d87de6499475301ce
@@ -121,11 +29,68 @@ def daylength(dayOfYear, lat):
         )
         return 2.0 * hourAngle / 15.0
 
+# List non-QC features
+def features(data):
+    return [f for f in data.columns.values if not f.endswith("_QC")]  
+    
+def build_smooth_discard_mask(df, bad_data_mask):
+        def blur(x):
+            d = x.loc[x.index[0][0]]
+            return d.rolling(window="29d", center=True, min_periods=14).apply(
+                lambda w: w.sum() > len(w) / 2
+            )
+
+        smooth_bad_data_mask = (
+            bad_data_mask.groupby("site").apply(lambda x: blur(x)) == 1
+        )
+        trash_count = smooth_bad_data_mask.sum()
+        print(
+            f"Samples to discard: {trash_count} ({(smooth_bad_data_mask.sum() / len(df)).round(2) * 100}%)"
+        )
+        return smooth_bad_data_mask
+        
+def build_windowed_discard_mask(df, bad_data_mask, window_size, na_check_columns):
+    def windowed_mask(d, m, mask_name="mask"):
+        def g(x, n):
+            return x.sum() == n
+
+        def r(d, n):
+            return d[mask_name].rolling(n, step=n).apply(lambda x: g(x, n))
+
+        windowed_mask_name = mask_name + "_window"
+        d[windowed_mask_name] = r(d, m)
+        d[windowed_mask_name] = d[windowed_mask_name].shift(1 - m)
+        d[windowed_mask_name].ffill(limit=m - 1, inplace=True)
+        return d
+    
+    a = pd.DataFrame()
+    a["mask"] = (~bad_data_mask) & (~df[na_check_columns].isnull().any(axis=1))
+    a = a.groupby("site").apply(lambda x: windowed_mask(x.droplevel(0), window_size))
+    return (a["mask_window"] != 1)
+
+        
+def add_rolling_window_features(df, rolling_variables):
+    print("Adding rolling window features")
+
+    def func(x, window):
+        df = x.loc[x.index[0][0]]
+        return df.rolling(window=f"{window}d", min_periods=int(window / 2)).apply(
+            lambda w: w.mean()
+        )
+
+    for f in rolling_variables:
+        for period in [1, 4]:
+            print(f"Processing {f}_{period}w...")
+            df[f"{f}_{period}w"] = df.groupby("site").apply(
+                lambda x: func(x[f], period * 7)
+            )
+    
 # Load data from path and performs the processing defined in the EDA (feature engineering, bad removal).
 # It does not perform scaling or outlier remval so there is no data leakage here.
 # If qc_threshold is defined (between 0 and 1), cleaning badsed on QC values is performed.
+# If window_size is set, full well-formed windows are kept and rolling variables are not added (the window_size parameter does not configure the rolling variables)
 # For details about the actions performed, please see in the EDA.
-def process_multi_site(path, metadata_path, qc_threshold=None, show_na=False, keep_qc=False, rolling_variables=["P_F", "TA_F_MDS", "VPD_F_MDS"]):
+def process_multi_site(path, metadata_path, qc_threshold=None, show_na=False, keep_qc=False, rolling_variables=["P_F", "TA_F_MDS", "VPD_F_MDS"], window_size=None, interpolate=False):
     print("Loading the data")
     df = pd.read_csv(path)
     df["TIMESTAMP"] = pd.to_datetime(df["TIMESTAMP"])
@@ -144,29 +109,7 @@ def process_multi_site(path, metadata_path, qc_threshold=None, show_na=False, ke
     print("Adding GPP and GPP_diff")
     df["GPP"] = df[["GPP_NT_VUT_REF", "GPP_DT_VUT_REF"]].mean(axis=1, skipna=False)
     df["GPP_diff"] = df["GPP_NT_VUT_REF"] - df["GPP_DT_VUT_REF"]
-
-    def features(data):
-        return [f for f in data.columns.values if not f.endswith("_QC") or keep_qc]
-
-    if qc_threshold:
-        f_qc_check = ["TA_F_MDS_QC", "SW_IN_F_MDS_QC", "VPD_F_MDS_QC", "NEE_VUT_REF_QC"]
-        bad_data_mask = (df[f_qc_check] < qc_threshold).any(axis=1)
-
-        def blur(x):
-            d = x.loc[x.index[0][0]]
-            return d.rolling(window="29d", center=True, min_periods=14).apply(
-                lambda w: w.sum() > len(w) / 2
-            )
-
-        smooth_bad_data_mask = (
-            bad_data_mask.groupby("site").apply(lambda x: blur(x)) == 1
-        )
-        trash_count = smooth_bad_data_mask.sum()
-        print(
-            f"Samples to discard: {trash_count} ({(smooth_bad_data_mask.sum() / len(df)).round(2) * 100}%)"
-        )
-        df = df[features(df)].copy()[~smooth_bad_data_mask]
-
+    
     print("Dropping unused features")
     discarded_features = [
         "NETRAD",
@@ -191,20 +134,18 @@ def process_multi_site(path, metadata_path, qc_threshold=None, show_na=False, ke
     for f in df.select_dtypes(include="number").columns:
         nullate_lower_than(df, f)
 
-    print("Adding rolling window features")
-
-    def func(x, window):
-        d = x.loc[x.index[0][0]]
-        return d.rolling(window=f"{window}d", min_periods=int(window / 2)).apply(
-            lambda w: w.mean()
-        )
-
-    for f in rolling_variables:
-        for period in [1, 4]:
-            print(f"Processing {f}_{period}w...")
-            df[f"{f}_{period}w"] = df.groupby("site").apply(
-                lambda x: func(x[f], period * 7)
-            )
+    if qc_threshold:
+        qc_check=["TA_F_MDS_QC", "SW_IN_F_MDS_QC", "VPD_F_MDS_QC", "NEE_VUT_REF_QC"]
+        bad_data_mask = (df[qc_check] < qc_threshold).any(axis=1)
+        if window_size is None:
+            discard_mask = remove_bad_data(df, bad_data_mask)
+        else:
+            na_check_columns = [ "TA_F_MDS", "GPP" ]
+            discard_mask = build_windowed_discard_mask(df, bad_data_mask, window_size, na_check_columns)
+        df = df.copy()[~discard_mask]
+    
+    if window_size is None:
+        add_rolling_window_features(df, rolling_variables)
 
     print("Adding engineered features")
     df["day_length"] = df.apply(lambda x: daylength(x["day_of_year"], x["lat"]), axis=1)
@@ -213,8 +154,11 @@ def process_multi_site(path, metadata_path, qc_threshold=None, show_na=False, ke
     )
     df["apar"] = df["SW_IN_F_MDS"] * df["FPAR"]
     df["TA_F_MDS**2"] = (df["TA_F_MDS"] + 41) ** 2
-    df["TA_F_MDS_1w**2"] = (df["TA_F_MDS_1w"] + 41) ** 2
-    df["TA_F_MDS_4w**2"] = (df["TA_F_MDS_4w"] + 41) ** 2
+    try:
+        df["TA_F_MDS_1w**2"] = (df["TA_F_MDS_1w"] + 41) ** 2
+        df["TA_F_MDS_4w**2"] = (df["TA_F_MDS_4w"] + 41) ** 2
+    except:
+        pass
 
     print("Remove unused features")
     excluded_features = [
@@ -227,17 +171,21 @@ def process_multi_site(path, metadata_path, qc_threshold=None, show_na=False, ke
         "day_of_year",
         "month",
         "year",
+        "VPD_DAY_F_MDS",
+        "TA_DAY_F_MDS",
+        "P_F"
     ]
     if not keep_qc:
         excluded_features = excluded_features + ["GPP_diff"]
-    working_features = [f for f in features(df) if f not in excluded_features]
+    working_features = [f for f in df.columns.values if (f not in excluded_features) and (keep_qc or (not f.endswith("_QC")))]
     df = df[working_features].copy()
-    df.shape
-
-    df.drop(["VPD_DAY_F_MDS", "TA_DAY_F_MDS", "P_F"], axis=1, inplace=True)
-    df.shape
-
+    
     print(f"NA: {(df.isna().any(axis=1)).sum()}")
+
+    if interpolate is True or window_size is not None:
+        print("Interpolating")
+        df.interpolate(inplace=True)
+    
     if show_na:
         msno.matrix(df, labels=True)
         plt.show()
@@ -248,7 +196,7 @@ def process_multi_site(path, metadata_path, qc_threshold=None, show_na=False, ke
 # Load data from path and performs the processing defined in the EDA (feature engineering, bad removal).
 # It does not perform scaling or outlier remval so there is no data leakage here.
 # For details about the actions performed, please see in the EDA.
-def process_single_site(path, metadata_path, with_rolling_windows=True):
+def process_single_site(path, metadata_path, with_rolling_windows=True, interpolate=False):
     print("Loading the data")
     df = pd.read_csv(path)
     df["TIMESTAMP"] = pd.to_datetime(df["TIMESTAMP"])
@@ -268,10 +216,6 @@ def process_single_site(path, metadata_path, with_rolling_windows=True):
     print("Adding GPP and GPP_diff")
     df["GPP"] = df[["GPP_NT_VUT_REF", "GPP_DT_VUT_REF"]].mean(axis=1, skipna=False)
     df["GPP_diff"] = df["GPP_NT_VUT_REF"] - df["GPP_DT_VUT_REF"]
-
-
-    def features(data):
-        return [f for f in data.columns.values if not f.endswith("_QC")]
 
     print("Dropping unused features")
     discarded_features = [
@@ -354,29 +298,12 @@ def process_single_site(path, metadata_path, with_rolling_windows=True):
     df.shape
 
     print(f"NA: {(df.isna().any(axis=1)).sum()}")
+
+    if interpolate:
+        print("Interpolating")
+        df.interpolate(inplace=True)
+        
     msno.matrix(df, labels=True)
     plt.show()
     
     return df
-
-
-# Given a model and data, computes several metrics
-def compute_metrics(model, X, y, label="", verbose=True):
-    if verbose:
-        print("----")
-        print(f"Predicting {label}...")
-    start = time.time()
-    y_pred = model.predict(X)
-    end = time.time()
-    pred_time = round(end - start, 2)
-    # Compute the metrics
-    r2 = R2(y, y_pred).round(2)
-    mae = MAE(y, y_pred).round(2)
-    rmse = RMSE(y, y_pred).round(2)
-    # Print
-    if verbose:
-        print(f"Prediction time: {pred_time}s")
-        print(f"Score ({label}): {r2}")
-        print(f"MAE ({label}): {mae}")
-        print(f"RMSE ({label}): {rmse}")
-    return y_pred, pred_time, r2, mae, rmse

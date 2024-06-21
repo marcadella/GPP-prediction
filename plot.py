@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from shared import reload_model, compute_metrics
+from model import reload_model, compute_metrics
 from matplotlib import cm
 from matplotlib.colors import Normalize
 from scipy.interpolate import interpn
@@ -291,8 +291,13 @@ def characteristic(model, y_true):
 def predict_all(X, y, label, models=model_list):
     results = []
     d = y.copy()
-    for model_name in model_list:
+    for model_name in models:
         print(f"Predicting {model_name}...")
+        if model_name.startswith("lstm"):
+            to_remove = ["P_F_1w", "P_F_4w", "TA_F_MDS_1w", "TA_F_MDS_1w**2", "TA_F_MDS_4w", "TA_F_MDS_4w**2", "VPD_F_MDS_1w", "VPD_F_MDS_4w"]
+        else:
+            to_remove = []
+        X_clean = X.drop(to_remove, axis=1)
         model = reload_model(model_name)
         (
             d[model_name],
@@ -300,7 +305,7 @@ def predict_all(X, y, label, models=model_list):
             r2,
             mae,
             rmse,
-        ) = compute_metrics(model, X, y, verbose=False)
+        ) = compute_metrics(model, X_clean, y, verbose=False)
         res = {
             "model": model_name,
             f"pred_time_{label}": pred_time,

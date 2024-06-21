@@ -23,22 +23,121 @@ from sklearn.dummy import DummyRegressor
 import textwrap
 from matplotlib.ticker import MaxNLocator
 from sklearn.base import clone
-from shared import (
-    PickleableKerasRegressor,
-    HistoryKerasRegressor,
-    model_fun,
-    reload_model,
-    compute_metrics
-)
 from extra import ding
 from grid_search_patch import grid_search
 import json
 import matplotlib.colors as colors
+import h5py
+import io
+from tensorflow import keras
+from tensorflow.keras.wrappers.scikit_learn import KerasRegressor
+from tensorflow.keras import regularizers, layers, models, optimizers, callbacks
+from sklearn.base import BaseEstimator
+from pickle import load
 
 resources = "resources/"
 memory = ".memory"
 tv_split_path = os.path.join(resources, "tv_split.csv.gz")
 test_split_path = os.path.join(resources, "test_split.csv.gz")
+
+# KerasRegressor is not pickleable. This wrapper is meant to solve this issue, but it does work with callbacks...
+# Solution from https://github.com/keras-team/keras/issues/13168#issuecomment-672792106
+class PickleableKerasRegressor(KerasRegressor, BaseEstimator):       
+    def _pickle_model(self):
+        bio = io.BytesIO()
+        with h5py.File(bio, "w") as f:
+            self.model.save(f)
+        return bio
+
+    def _unpickle_model(self, model):
+        with h5py.File(model, "r") as f:
+            model = models.load_model(f)
+        return model
+
+    def __getstate__(self):
+        state = BaseEstimator.__getstate__(self)
+        if hasattr(self, "model"):
+            state["model"] = self._pickle_model()
+        return state
+
+    def __setstate__(self, state):
+        if state.get("model", None):
+            state["model"] = self._unpickle_model(state["model"])
+        return BaseEstimator.__setstate__(self, state)
+
+
+# It is unfortunately not possible to get the history when using KerasRegressor within a Pipeline.
+# This wrapper is solving this issue by saving the history locally.
+# It is however not pickleable somehow, so we could not merge it with PickleableKerasRegressor.
+class HistoryKerasRegressor(KerasRegressor, BaseEstimator):
+    def __init__(self, *args, **kwargs):
+        super(KerasRegressor, self).__init__(*args, **kwargs)
+        self.history = None
+        
+    def get_history(self):
+        return self.history
+    
+    def fit(self, X, y, *args, **kwargs):
+        self.history = KerasRegressor.fit(self, X, y, *args, **kwargs)
+        return self.history
+    
+# Given a model and data, computes several metrics
+def compute_metrics(model, X, y, label="", verbose=True):
+    if verbose:
+        print("----")
+        print(f"Predicting {label}...")
+    start = time.time()
+    y_pred = model.predict(X)
+    end = time.time()
+    pred_time = round(end - start, 2)
+    # Compute the metrics
+    r2 = R2(y, y_pred).round(2)
+    mae = MAE(y, y_pred).round(2)
+    rmse = RMSE(y, y_pred).round(2)
+    # Print
+    if verbose:
+        print(f"Prediction time: {pred_time}s")
+        print(f"Score ({label}): {r2}")
+        print(f"MAE ({label}): {mae}")
+        print(f"RMSE ({label}): {rmse}")
+    return y_pred, pred_time, r2, mae, rmse
+
+# Function generating our Keras model
+def dnn_gen(
+    hidden=3,
+    neurons=30,
+    dropout=0,
+    learning_rate=0.003,
+    input_shape=[22],
+    activation="relu",
+    l2=0.01,
+    loss="mse",
+    show_summary=False
+):
+    model = models.Sequential()
+    model.add(layers.InputLayer(input_shape=input_shape))
+    for layer in range(hidden):
+        model.add(
+            layers.Dense(
+                neurons, activation=activation, kernel_regularizer=regularizers.L2(l2)
+            )
+        )
+        if dropout != 0:
+            model.add(layers.Dropout(dropout))
+    model.add(layers.Dense(1))
+    optimizer = optimizers.SGD(learning_rate=learning_rate)
+    model.compile(loss=loss, optimizer=optimizer)
+    if show_summary:
+        model.summary()
+    return model
+
+
+# Load a model by unpickleing it
+# Do NOT call load_model because of name conflict!
+def reload_model(name):
+    with open(os.path.join("resources", f"{name}.pkl"), "rb") as f:
+        model = load(f)
+    return model
 
 # Load data and return feature matrix and target vector
 def load_data(path):
@@ -75,6 +174,18 @@ def train_and_test(model_name, model, X_tv, y_tv, X_test, y_test, fit_params={})
             dump(model, f, protocol=5)
     return train_time, y_pred, pred_time, r2, mae, rmse
 
+
+def plot_net_training_curves(history):
+    plt.plot(history.history["loss"], label="train loss")
+    plt.plot(history.history["val_loss"], label="val loss")
+    plt.title(
+        "Validation loss {:.3f}".format(np.mean(history.history["val_loss"][-3:]))
+    )
+    plt.xlabel("epoch")
+    plt.ylabel("loss value")
+    plt.legend()
+    plt.show()
+    
 
 # Format a string using a text wrapper
 def formatter(lbl, pos=0):
@@ -171,6 +282,9 @@ def truncate_colormap(cmap, minval=0.0, maxval=1.0, n=100):
 
 default_cmap = truncate_colormap(plt.get_cmap("Blues_r"), 0.3, 1)    
 
+# Display a plot (resp. heat map) to show the evolution of the score for one (resp. two) hyperparameters
+# kind: 'bar' or 'line' (for one hyperparameter only)
+# Passing subset=None should find a decent subset for heat maps, unfortunately, there seem to be an issue in the underlying library.
 def hyperparam_plot(
     model, parameters, subset={}, kind="bar", cmap=default_cmap, prefix="regressor__", figsize=(8, 8)
 ):
@@ -178,7 +292,19 @@ def hyperparam_plot(
     parameters = [f"{prefix}{p}" for p in parameters]
     if len(parameters) == 1:
         parameters = parameters[0]
-    subset = {f"{prefix}{k}": v for k, v in subset.items()}
+        if subset is None:
+            subset == {}
+    if subset is None:
+        # We fill subset with the set of best parameters (among those which are not in 'parameters')
+        cv = pd.DataFrame(model.cv_results_)
+        best_idx = cv["mean_test_score"].idxmax()
+        best_params = cv.iloc[best_idx]["params"]
+        for k in parameters:
+            best_params.pop(k, None)
+        print(best_params)
+        subset = best_params
+    else:
+        subset = {f"{prefix}{k}": v for k, v in subset.items()}
     # See doc here: https://sklearn-evaluation.ploomber.io/en/latest/classification/optimization.html#visualise-results
     ax = grid_search(
         model.cv_results_,
@@ -186,7 +312,8 @@ def hyperparam_plot(
         subset=subset,
         kind=kind,
         cmap=cmap,
-        ax=ax
+        ax=ax,
+        #sort=False
     )
 
     def print_dict(d):
