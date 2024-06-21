@@ -23,9 +23,13 @@ This project is composed of the following Jupyter notebooks:
 - 0_background.ipynb
 - 1_data_collection.ipynb
 - 2_data_overview.ipynb
-- 3_eda.ipynb
+- 3_EDA.ipynb
 - 4_data_modeling.ipynb
-- 5_model_comparison.ipynb
+- 5_LSTM.ipynb
+- 6_model_comparison.ipynb
+- 7_cross_site_evaluation.ipynb
+- 8_with_sample_weight.ipynb (draft)
+- 9_LSTM_tests.ipynb (draft)
 
 Each notebook saves the data necessary for later notebooks in the `resources` directory in such a way that the notebooks may be run in any order.
 The raw data is also located in the `resources` directory.
