@@ -309,6 +309,45 @@ def lstm_gen(
     # model.summary()
     return model
 
+def lstm_dense_gen(
+    lstm_units,
+    dense_units,
+    learning_rate,
+    dropout=0,
+    recurrent_dropout=0,
+    kernel_regularizer=0,
+    recurrent_regularizer=0,
+    seed=0,
+):
+    model = tf.keras.models.Sequential(
+        [
+            # Shape [batch, time, features] => [batch, time, lstm_units]
+            tf.keras.layers.LSTM(
+                lstm_units,
+                return_sequences=True,
+                dropout=dropout,
+                recurrent_dropout=recurrent_dropout,
+                kernel_regularizer=tf.keras.regularizers.L2(kernel_regularizer),
+                recurrent_regularizer=tf.keras.regularizers.L2(recurrent_regularizer),
+                # seed=seed
+            ),
+            tf.keras.layers.Dense(
+                units=dense_units,
+                activation="relu",
+                kernel_regularizer=tf.keras.regularizers.L2(kernel_regularizer),
+            ),
+            # Shape => [batch, time, features]
+            tf.keras.layers.Dense(units=1),
+        ]
+    )
+    model.compile(
+        loss=tf.keras.losses.MeanSquaredError(),
+        optimizer=tf.keras.optimizers.Adam(learning_rate),
+        metrics=[tf.keras.metrics.MeanAbsoluteError()],
+    )
+    # model.summary()
+    return model
+
 def prepare_splits(df, max_window, tv_cut = 0.8):
     nb_features = df.shape[1]
     array = df.to_numpy().reshape(-1, max_window, nb_features)
