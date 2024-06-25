@@ -138,14 +138,13 @@ def process_multi_site(path, metadata_path, qc_threshold=None, show_na=False, ke
         qc_check=["TA_F_MDS_QC", "SW_IN_F_MDS_QC", "VPD_F_MDS_QC", "NEE_VUT_REF_QC"]
         bad_data_mask = (df[qc_check] < qc_threshold).any(axis=1)
         if window_size is None:
-            discard_mask = remove_bad_data(df, bad_data_mask)
+            discard_mask = build_smooth_discard_mask(df, bad_data_mask)
         else:
             na_check_columns = [ "TA_F_MDS", "GPP" ]
             discard_mask = build_windowed_discard_mask(df, bad_data_mask, window_size, na_check_columns)
         df = df.copy()[~discard_mask]
     
-    if window_size is None:
-        add_rolling_window_features(df, rolling_variables)
+    add_rolling_window_features(df, rolling_variables)
 
     print("Adding engineered features")
     df["day_length"] = df.apply(lambda x: daylength(x["day_of_year"], x["lat"]), axis=1)
@@ -172,9 +171,10 @@ def process_multi_site(path, metadata_path, qc_threshold=None, show_na=False, ke
         "month",
         "year",
         "VPD_DAY_F_MDS",
-        "TA_DAY_F_MDS",
-        "P_F"
+        "TA_DAY_F_MDS"
     ]
+    if window_size is None:
+        excluded_features = excluded_features + ["P_F"]
     if not keep_qc:
         excluded_features = excluded_features + ["GPP_diff"]
     working_features = [f for f in df.columns.values if (f not in excluded_features) and (keep_qc or (not f.endswith("_QC")))]
